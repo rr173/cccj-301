@@ -14,17 +14,25 @@ from .model import (
     BookingIn,
     ClosureIn,
     ClosureOut,
+    CloseIn,
     ConfirmIn,
     ErrorBody,
+    FindPersonIn,
+    HandoverActionIn,
+    HandoverIn,
+    IncidentIn,
     JourneyOut,
     PlanOut,
     PlanRequest,
+    RegisterPeopleIn,
     RunIn,
+    SearchIn,
     SegmentIn,
     Window,
 )
 from .network import Segment as DomainSegment
-from . import shuttle
+from . import evacuation, shuttle
+from .evacuation import EvacError
 from .shuttle import ShuttleError
 from .trips import Trip, TripError, start_trip, sync_trip
 
@@ -85,6 +93,14 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     async def _shuttle_error(_request: Request, exc: ShuttleError) -> JSONResponse:
         body = ErrorBody(detail=exc.detail, reason=exc.reason)  # type: ignore[arg-type]
         return JSONResponse(status_code=exc.status, content=body.model_dump())
+
+    @app.exception_handler(EvacError)
+    async def _evac_error(_request: Request, exc: EvacError) -> JSONResponse:
+        body = ErrorBody(detail=exc.detail, reason=exc.reason)  # type: ignore[arg-type]
+        content = body.model_dump()
+        if exc.extra:
+            content.update(exc.extra)
+        return JSONResponse(status_code=exc.status, content=content)
 
     # ---------------------------------------------------------------- network
     @app.post("/segments", status_code=201)
@@ -253,6 +269,101 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     @app.post("/bookings/{booking_id}/cancel")
     def cancel_booking(booking_id: int, db: Database = Depends(get_db)):
         return shuttle.cancel_booking(db, booking_id)
+
+    # ============================================================== evacuation
+    def _created(view, created: bool) -> JSONResponse:
+        # A fresh mutation answers 201; an identical request-id replay answers
+        # 200 with the stored result, mirroring the booking endpoints.
+        return JSONResponse(status_code=201 if created else 200, content=view)
+
+    @app.post("/evac/incidents")
+    def open_incident(body: IncidentIn, db: Database = Depends(get_db)):
+        view, created = evacuation.create_incident(db, body)
+        return _created(view, created)
+
+    @app.get("/evac/incidents")
+    def list_incidents(db: Database = Depends(get_db)):
+        return [
+            evacuation.incident_view(db, incident_id).model_dump()
+            for incident_id in evacuation.list_incident_ids(db)
+        ]
+
+    @app.get("/evac/incidents/{incident_id}")
+    def read_incident(incident_id: int, db: Database = Depends(get_db)):
+        with db.lock:
+            return evacuation.incident_view(db, incident_id).model_dump()
+
+    @app.post("/evac/incidents/{incident_id}/people")
+    def register_people(
+        incident_id: int, body: RegisterPeopleIn, db: Database = Depends(get_db)
+    ):
+        view, created = evacuation.register_people(db, incident_id, body)
+        return _created(view, created)
+
+    @app.post("/evac/incidents/{incident_id}/findings")
+    def record_finding(
+        incident_id: int, body: FindPersonIn, db: Database = Depends(get_db)
+    ):
+        view, created = evacuation.record_finding(db, incident_id, body)
+        return _created(view, created)
+
+    @app.post("/evac/incidents/{incident_id}/handovers")
+    def create_handover(
+        incident_id: int, body: HandoverIn, db: Database = Depends(get_db)
+    ):
+        view, created = evacuation.create_handover(db, incident_id, body)
+        return _created(view, created)
+
+    @app.get("/evac/incidents/{incident_id}/handovers")
+    def list_handovers(incident_id: int, db: Database = Depends(get_db)):
+        with db.lock:
+            view = evacuation.incident_view(db, incident_id)
+        return [h.model_dump() for h in view.handovers]
+
+    @app.post("/evac/incidents/{incident_id}/handovers/{handover_id}/receive")
+    def receive_handover(
+        incident_id: int,
+        handover_id: int,
+        body: HandoverActionIn,
+        db: Database = Depends(get_db),
+    ):
+        view, created = evacuation.receive_handover(
+            db, incident_id, handover_id, body
+        )
+        return _created(view, created)
+
+    @app.post("/evac/incidents/{incident_id}/handovers/{handover_id}/return")
+    def return_handover(
+        incident_id: int,
+        handover_id: int,
+        body: HandoverActionIn,
+        db: Database = Depends(get_db),
+    ):
+        view, created = evacuation.return_handover(
+            db, incident_id, handover_id, body
+        )
+        return _created(view, created)
+
+    @app.post("/evac/incidents/{incident_id}/zones/{zone}/search")
+    def start_search(
+        incident_id: int, zone: str, body: SearchIn, db: Database = Depends(get_db)
+    ):
+        view, created = evacuation.start_search(db, incident_id, zone, body)
+        return _created(view, created)
+
+    @app.post("/evac/incidents/{incident_id}/zones/{zone}/clearance")
+    def confirm_clearance(
+        incident_id: int, zone: str, body: SearchIn, db: Database = Depends(get_db)
+    ):
+        view, created = evacuation.confirm_clearance(db, incident_id, zone, body)
+        return _created(view, created)
+
+    @app.post("/evac/incidents/{incident_id}/close")
+    def close_incident(
+        incident_id: int, body: CloseIn, db: Database = Depends(get_db)
+    ):
+        view, created = evacuation.close_incident(db, incident_id, body)
+        return _created(view, created)
 
     return app
 

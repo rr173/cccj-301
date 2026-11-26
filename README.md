@@ -86,6 +86,18 @@ unrelated request wait for a large re-plan.
 | `GET`    | `/bookings/{id}`         | read one booking by its id                |
 | `GET`    | `/bookings/by-request/{request_id}` | read one booking by request id   |
 | `POST`   | `/bookings/{id}/cancel`  | cancel before first boarding              |
+| `POST`   | `/evac/incidents`        | open an evacuation incident (idempotent)  |
+| `GET`    | `/evac/incidents`        | list incidents with their full ledgers    |
+| `GET`    | `/evac/incidents/{id}`   | full headcount/handover/clearance ledger  |
+| `POST`   | `/evac/incidents/{id}/people`    | register people to account for   |
+| `POST`   | `/evac/incidents/{id}/findings`  | locate a still-unverified person |
+| `POST`   | `/evac/incidents/{id}/handovers` | submit a departure manifest      |
+| `GET`    | `/evac/incidents/{id}/handovers` | list the incident's manifests    |
+| `POST`   | `/evac/incidents/{id}/handovers/{h}/receive` | receiver confirms arrivals |
+| `POST`   | `/evac/incidents/{id}/handovers/{h}/return`  | sender confirms turn-backs  |
+| `POST`   | `/evac/incidents/{id}/zones/{zone}/search`    | start an on-site search |
+| `POST`   | `/evac/incidents/{id}/zones/{zone}/clearance` | confirm a zone is clear |
+| `POST`   | `/evac/incidents/{id}/close`       | close the incident when fully accounted |
 
 Example:
 
@@ -221,6 +233,116 @@ chooses runs for a visitor, never re-books because an accessible segment is
 closed, and performs no payment or UI work.  The original routing and
 live-trip endpoints are unchanged.
 
+## Evacuation headcount and clearance
+
+When an exhibition zone is evacuated the commander needs two independent
+guarantees: every person has reached a safe assembly point, and every zone has
+actually been searched and cleared.  This service keeps that ledger.  It is
+deliberately separate from the routing and shuttle services — a walking plan
+or a shuttle booking is **never** evidence that anyone reached safety.  Only a
+registered finding or a confirmed handover moves a person.
+
+### Opening an incident
+
+`POST /evac/incidents` names the zones that must be cleared and the safe
+assembly points, using existing stop names.  The two sets must be disjoint and
+every name must be a stop already used by a segment.  Like bookings, the call
+carries a client-generated `request_id`; reposting an identical body returns
+the original incident (`200`), while reusing the id with different content is
+rejected (`409 duplicate_request`).
+
+```bash
+curl -s localhost:8000/evac/incidents -X POST -H 'content-type: application/json' -d '{
+  "request_id": "drill-2026-11-26",
+  "name": "Hall evacuation",
+  "zones": ["HallA", "HallB", "HallC"],
+  "safe_points": ["Plaza", "Gate"] }'
+```
+
+### People and findings
+
+People are registered with a person number unique inside the incident, either
+with a known starting zone or with the location still to be verified
+(`"zone": null`, or omitted).  Registration stays open while the incident is
+open, so late arrivals can be added.
+
+- `POST /evac/incidents/{id}/people` registers a batch (all-or-nothing).
+- `POST /evac/incidents/{id}/findings` records where an **unlocated** person was
+  actually found — a zone or a safe point.  A person found at a safe point is
+  safe immediately.  Once a person has a recorded location, another "finding"
+  is rejected (`409 person_not_unknown`): located people can only move through
+  handovers, so a report cannot bypass the chain of custody.
+
+A person is always in exactly one state: `unknown`, `in_zone`, `in_transit`,
+or `safe`.  People at a safe point never take part in another transfer.
+
+### Handovers (chain of custody)
+
+Movement between zones, or from a zone to a safe point, uses a manifest.
+
+1. `POST /evac/incidents/{id}/handovers` — the sending zone lists the people
+   who actually left.  Every listed person must currently be physically in
+   that zone; they immediately become `in_transit` and cannot appear on any
+   other manifest until this one is resolved.
+2. `POST .../handovers/{handover_id}/receive` — the receiving party confirms
+   the people who actually arrived.  A subset is allowed; everyone else stays
+   in transit.  On a handover to a safe point, a received person becomes `safe`
+   only at this point.  On a zone-to-zone handover they enter that zone.
+3. `POST .../handovers/{handover_id}/return` — if someone turns back, the
+   sender confirms the people who actually returned to the originating zone
+   (again, a subset is allowed).
+
+Each person on a manifest is resolved at most once: `received` or `returned`.
+Receive and return are mutually exclusive — under concurrent terminals exactly
+one request wins for a given person; the other gets
+`409 already_resolved`.  A manifest is `complete` once it has no pending
+people.  Every batch request validates its whole list before writing, so a
+request containing one invalid person changes nothing.
+
+### Search and clearance
+
+`POST /evac/incidents/{id}/zones/{zone}/search` starts an on-site search.  It
+is allowed only while the zone is empty and no open handover touches it
+(`409 zone_not_empty` / `409 open_handover` otherwise).  When the sweep is
+done, `POST .../zones/{zone}/clearance` records the clearance.
+
+Each zone keeps an **activity version** that advances on every person entering
+or leaving the zone and on every handover change touching it — including
+creation of a manifest into the zone, before anyone is received.  A search
+captures the current version; if the version moves while the search is active
+(or after clearance), the search becomes invalid and any clearance it produced
+is void.  Even if the zone later becomes empty again it must be searched
+afresh (`409 search_stale` on an attempt to confirm the stale search).
+Activity in other zones has its own version and never disturbs this zone.
+
+### Closing the incident
+
+`GET /evac/incidents/{id}` returns the whole consistent ledger: every person's
+whereabouts, every manifest with its `pending` / `received` / `returned` lists,
+per-zone search and clearance state, and the computed `ready_to_close` flag
+with explicit `blockers`:
+
+- `people_not_at_safe_point` — person numbers not yet `safe`;
+- `open_handovers` — manifests that still have pending people;
+- `zones_without_valid_clearance` — zones lacking a current valid clearance.
+
+`POST /evac/incidents/{id}/close` succeeds only when all three lists are empty.
+A closed incident keeps its full results, remains readable, and rejects every
+further mutation (`409 incident_closed`).
+
+### Request ids, concurrency and persistence
+
+Every mutating request carries an incident-scoped `request_id` (the id that
+opens an incident is globally unique).  An identical replay returns the stored
+result with HTTP `200` without redoing any work; reusing an id with different
+content is `409 duplicate_request`.  Failed (rejected) requests are not
+stored, so their id remains usable.  All mutations run under the process-wide
+lock inside one SQLite transaction: conflicting receive/return calls cannot
+both succeed, a batch never half-applies, and a reader can never observe a
+handover and a clearance that contradict each other.  All state, including the
+idempotency ledger, is persisted, so work continues after a server restart
+against the same database.
+
 ## Planner
 
 Backward dynamic program over `(stop, minute)` states. For each accessible
@@ -238,6 +360,7 @@ pip install -r requirements-dev.txt
 ./run.sh                       # http://127.0.0.1:8000  (SQLite: exhibition.db)
 python3 -m app.demo            # seed a tiny demo network, print a plan
 python3 -m app.demo_shuttle    # book and ride a two-leg shuttle transfer
+python3 -m app.demo_evacuation # run a full evacuation headcount to closure
 python3 -m pytest              # full test suite
 ```
 
@@ -279,3 +402,20 @@ untouched.
   after cancellation/arrival/departure;
 - state surviving a full application restart against the same SQLite file, and
   concurrent bookings that never oversell a single wheelchair space.
+
+`tests/test_evacuation.py` covers the evacuation service end to end:
+
+- incident setup on existing stop names with disjoint zones/safe points and
+  idempotent creation;
+- batch registration (including later additions and location-to-be-verified),
+  findings restricted to unlocated people, and the all-or-nothing batch rule;
+- handover manifests: partial receive, partial return, people locked in
+  transit, safe-point safety only on receipt, one resolution per person, and a
+  concurrent receive/return race with exactly one winner;
+- search preconditions, clearance invalidation on any touching activity (with
+  mandatory re-search even after the zone re-empties), and independence of
+  per-zone activity versions;
+- closure blockers across all three categories, closure immutability,
+  request-id replay and changed-content rejection, full state plus idempotency
+  surviving a restart, and the original planning/shuttle endpoints remaining
+  available.

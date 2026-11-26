@@ -115,6 +115,90 @@ CREATE TABLE IF NOT EXISTS booking_legs (
     UNIQUE (booking_id, leg_position)
 );
 CREATE INDEX IF NOT EXISTS idx_legs_run ON booking_legs(run_id, status);
+
+-- ============================================================ evacuation
+CREATE TABLE IF NOT EXISTS evac_incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'closed'))
+);
+CREATE TABLE IF NOT EXISTS evac_locations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES evac_incidents(id) ON DELETE CASCADE,
+    stop_name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('zone', 'safe_point')),
+    UNIQUE (incident_id, stop_name)
+);
+CREATE TABLE IF NOT EXISTS evac_people (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES evac_incidents(id) ON DELETE CASCADE,
+    person_no TEXT NOT NULL,
+    -- unknown = location to be verified; in_zone; in_transit; safe.
+    status TEXT NOT NULL CHECK (
+        status IN ('unknown', 'in_zone', 'in_transit', 'safe')
+    ),
+    zone TEXT,
+    safe_point TEXT,
+    current_handover_id INTEGER,
+    UNIQUE (incident_id, person_no)
+);
+CREATE TABLE IF NOT EXISTS evac_handovers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES evac_incidents(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL,
+    from_zone TEXT NOT NULL,
+    to_location TEXT NOT NULL,
+    destination_kind TEXT NOT NULL
+        CHECK (destination_kind IN ('zone', 'safe_point')),
+    -- open while any person on it is still pending; complete otherwise.
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'complete'))
+);
+CREATE TABLE IF NOT EXISTS evac_handover_people (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    handover_id INTEGER NOT NULL
+        REFERENCES evac_handovers(id) ON DELETE CASCADE,
+    person_no TEXT NOT NULL,
+    -- pending = in transit; received = receiver confirmed; returned = sender
+    -- confirmed the person came back to the originating zone.
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'received', 'returned')),
+    UNIQUE (handover_id, person_no)
+);
+CREATE INDEX IF NOT EXISTS idx_hp_person ON evac_handover_people(person_no, status);
+-- Per-zone activity generation.  A search/clearance is valid only while the
+-- version captured when the search started still matches.
+CREATE TABLE IF NOT EXISTS evac_zone_versions (
+    incident_id INTEGER NOT NULL REFERENCES evac_incidents(id) ON DELETE CASCADE,
+    zone TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (incident_id, zone)
+);
+CREATE TABLE IF NOT EXISTS evac_searches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES evac_incidents(id) ON DELETE CASCADE,
+    zone TEXT NOT NULL,
+    started_version INTEGER NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    valid INTEGER NOT NULL DEFAULT 1,
+    cleared INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_searches_zone
+    ON evac_searches(incident_id, zone, active, valid);
+-- Idempotency ledger, scoped inside one incident.  A replay returns the stored
+-- response verbatim; a reused request id with different content is rejected.
+CREATE TABLE IF NOT EXISTS evac_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES evac_incidents(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    response_status INTEGER NOT NULL,
+    response_body TEXT NOT NULL,
+    UNIQUE (incident_id, request_id)
+);
 """
 
 from contextlib import contextmanager
@@ -595,3 +679,269 @@ class Database:
             " ORDER BY COALESCE(bl.actual_board_min, 1 << 30), bl.id",
             (run_id,),
         ).fetchall()
+
+    # ============================================================ evacuation
+    def stop_name_exists(self, name: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM segments WHERE from_stop=? OR to_stop=? LIMIT 1",
+            (name, name),
+        ).fetchone()
+        return row is not None
+
+    def insert_incident(self, request_id: str, name: str) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO evac_incidents(request_id, name) VALUES (?,?)",
+            (request_id, name),
+        )
+        return int(cur.lastrowid)
+
+    def get_incident_by_request(self, request_id: str):
+        return self._conn.execute(
+            "SELECT * FROM evac_incidents WHERE request_id=?", (request_id,)
+        ).fetchone()
+
+    def get_incident(self, incident_id: int):
+        return self._conn.execute(
+            "SELECT * FROM evac_incidents WHERE id=?", (incident_id,)
+        ).fetchone()
+
+    def list_incident_ids(self) -> list[int]:
+        rows = self._conn.execute(
+            "SELECT id FROM evac_incidents ORDER BY id"
+        ).fetchall()
+        return [row["id"] for row in rows]
+
+    def insert_location(self, incident_id: int, stop_name: str, kind: str) -> None:
+        self._conn.execute(
+            "INSERT INTO evac_locations(incident_id, stop_name, kind)"
+            " VALUES (?,?,?)",
+            (incident_id, stop_name, kind),
+        )
+
+    def incident_locations(self, incident_id: int) -> list:
+        return self._conn.execute(
+            "SELECT * FROM evac_locations WHERE incident_id=? ORDER BY id",
+            (incident_id,),
+        ).fetchall()
+
+    def init_zone_versions(self, incident_id: int, zones: list[str]) -> None:
+        self._conn.executemany(
+            "INSERT INTO evac_zone_versions(incident_id, zone, version)"
+            " VALUES (?,?,0)",
+            [(incident_id, zone) for zone in zones],
+        )
+
+    def bump_zone_version(self, incident_id: int, zone: str) -> None:
+        # Any person entry/leave or handover change touching a zone advances its
+        # generation, which invalidates the currently running search.
+        self._conn.execute(
+            "INSERT INTO evac_zone_versions(incident_id, zone, version)"
+            " VALUES (?,?,1)"
+            " ON CONFLICT(incident_id, zone) DO UPDATE SET version = version + 1",
+            (incident_id, zone),
+        )
+
+    def zone_version(self, incident_id: int, zone: str) -> int:
+        row = self._conn.execute(
+            "SELECT version FROM evac_zone_versions"
+            " WHERE incident_id=? AND zone=?",
+            (incident_id, zone),
+        ).fetchone()
+        return int(row["version"]) if row is not None else 0
+
+    def invalidate_zone_searches(self, incident_id: int, zone: str) -> None:
+        # A search whose generation changed can neither confirm nor keep a
+        # previous clearance alive.
+        self._conn.execute(
+            "UPDATE evac_searches SET valid=0 WHERE incident_id=? AND zone=?"
+            " AND valid=1",
+            (incident_id, zone),
+        )
+
+    def insert_person(
+        self,
+        incident_id: int,
+        person_no: str,
+        status: str,
+        zone: str | None,
+        safe_point: str | None,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO evac_people(incident_id, person_no, status, zone,"
+            " safe_point, current_handover_id) VALUES (?,?,?,?,?,NULL)",
+            (incident_id, person_no, status, zone, safe_point),
+        )
+
+    def get_person(self, incident_id: int, person_no: str):
+        return self._conn.execute(
+            "SELECT * FROM evac_people WHERE incident_id=? AND person_no=?",
+            (incident_id, person_no),
+        ).fetchone()
+
+    def list_people(self, incident_id: int) -> list:
+        return self._conn.execute(
+            "SELECT * FROM evac_people WHERE incident_id=? ORDER BY id",
+            (incident_id,),
+        ).fetchall()
+
+    def set_person_known(
+        self, incident_id: int, person_no: str, status: str,
+        zone: str | None, safe_point: str | None,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE evac_people SET status=?, zone=?, safe_point=?,"
+            " current_handover_id=NULL WHERE incident_id=? AND person_no=?",
+            (status, zone, safe_point, incident_id, person_no),
+        )
+
+    def set_person_transit(
+        self, incident_id: int, person_no: str, handover_id: int
+    ) -> None:
+        self._conn.execute(
+            "UPDATE evac_people SET status='in_transit', zone=NULL,"
+            " safe_point=NULL, current_handover_id=? WHERE incident_id=? AND"
+            " person_no=?",
+            (handover_id, incident_id, person_no),
+        )
+
+    def insert_handover(
+        self, incident_id: int, request_id: str, from_zone: str,
+        to_location: str, destination_kind: str,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO evac_handovers(incident_id, request_id, from_zone,"
+            " to_location, destination_kind) VALUES (?,?,?,?,?)",
+            (incident_id, request_id, from_zone, to_location, destination_kind),
+        )
+        return int(cur.lastrowid)
+
+    def insert_handover_people(
+        self, handover_id: int, person_nos: list[str]
+    ) -> None:
+        self._conn.executemany(
+            "INSERT INTO evac_handover_people(handover_id, person_no)"
+            " VALUES (?,?)",
+            [(handover_id, no) for no in person_nos],
+        )
+
+    def get_handover(self, incident_id: int, handover_id: int):
+        return self._conn.execute(
+            "SELECT * FROM evac_handovers WHERE incident_id=? AND id=?",
+            (incident_id, handover_id),
+        ).fetchone()
+
+    def list_handovers(self, incident_id: int) -> list:
+        return self._conn.execute(
+            "SELECT * FROM evac_handovers WHERE incident_id=? ORDER BY id",
+            (incident_id,),
+        ).fetchall()
+
+    def handover_people(self, handover_id: int) -> list:
+        return self._conn.execute(
+            "SELECT * FROM evac_handover_people WHERE handover_id=? ORDER BY id",
+            (handover_id,),
+        ).fetchall()
+
+    def handover_person_row(self, handover_id: int, person_no: str):
+        return self._conn.execute(
+            "SELECT * FROM evac_handover_people WHERE handover_id=? AND person_no=?",
+            (handover_id, person_no),
+        ).fetchone()
+
+    def set_handover_person_status(
+        self, handover_id: int, person_no: str, status: str
+    ) -> None:
+        self._conn.execute(
+            "UPDATE evac_handover_people SET status=? WHERE handover_id=?"
+            " AND person_no=?",
+            (status, handover_id, person_no),
+        )
+
+    def handover_has_pending(self, handover_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM evac_handover_people WHERE handover_id=?"
+            " AND status='pending' LIMIT 1",
+            (handover_id,),
+        ).fetchone()
+        return row is not None
+
+    def complete_handover_if_resolved(self, handover_id: int) -> None:
+        if not self.handover_has_pending(handover_id):
+            self._conn.execute(
+                "UPDATE evac_handovers SET status='complete' WHERE id=?",
+                (handover_id,),
+            )
+
+    def open_handover_ids_for_zone(
+        self, incident_id: int, zone: str
+    ) -> list[int]:
+        rows = self._conn.execute(
+            "SELECT id FROM evac_handovers WHERE incident_id=?"
+            " AND status='open' AND (from_zone=? OR to_location=?) ORDER BY id",
+            (incident_id, zone, zone),
+        ).fetchall()
+        return [row["id"] for row in rows]
+
+    def count_zone_occupants(self, incident_id: int, zone: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM evac_people WHERE incident_id=?"
+            " AND status='in_zone' AND zone=?",
+            (incident_id, zone),
+        ).fetchone()
+        return int(row["n"])
+
+    def start_search(self, incident_id: int, zone: str, version: int) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO evac_searches(incident_id, zone, started_version,"
+            " active, valid, cleared) VALUES (?,?,?,1,1,0)",
+            (incident_id, zone, version),
+        )
+        return int(cur.lastrowid)
+
+    def deactivate_zone_searches(self, incident_id: int, zone: str) -> None:
+        self._conn.execute(
+            "UPDATE evac_searches SET active=0 WHERE incident_id=? AND zone=?"
+            " AND active=1",
+            (incident_id, zone),
+        )
+
+    def active_search(self, incident_id: int, zone: str):
+        return self._conn.execute(
+            "SELECT * FROM evac_searches WHERE incident_id=? AND zone=?"
+            " AND active=1 ORDER BY id DESC LIMIT 1",
+            (incident_id, zone),
+        ).fetchone()
+
+    def mark_search_cleared(self, search_id: int) -> None:
+        self._conn.execute(
+            "UPDATE evac_searches SET cleared=1 WHERE id=?", (search_id,)
+        )
+
+    def close_incident(self, incident_id: int) -> None:
+        self._conn.execute(
+            "UPDATE evac_incidents SET status='closed' WHERE id=?",
+            (incident_id,),
+        )
+
+    def get_evac_request(self, incident_id: int, request_id: str):
+        return self._conn.execute(
+            "SELECT * FROM evac_requests WHERE incident_id=? AND request_id=?",
+            (incident_id, request_id),
+        ).fetchone()
+
+    def insert_evac_request(
+        self, incident_id: int, request_id: str, operation: str,
+        content_hash: str, response_status: int, response_body: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO evac_requests(incident_id, request_id, operation,"
+            " content_hash, response_status, response_body) VALUES (?,?,?,?,?,?)",
+            (
+                incident_id,
+                request_id,
+                operation,
+                content_hash,
+                response_status,
+                response_body,
+            ),
+        )

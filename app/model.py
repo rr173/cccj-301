@@ -1,9 +1,9 @@
 """Domain types and Pydantic request/response schemas."""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 # All times are within a single service day, so every minute value lives in
 # [0, 1440].  Keeping the domain small also bounds the planner's DP table.
@@ -147,6 +147,29 @@ class ErrorBody(BaseModel):
         "transfer_not_verified",
         "not_boardable",
         "illegal_event",
+        # ------------------------------------------------ evacuation headcount
+        "incident_not_found",
+        "incident_closed",
+        "unknown_location",
+        "unknown_person",
+        "person_already_registered",
+        "person_not_unknown",
+        "person_not_in_zone",
+        "person_already_safe",
+        "person_in_transit",
+        "handover_not_found",
+        "not_handover_party",
+        "empty_handover",
+        "duplicate_in_batch",
+        "already_resolved",
+        "zone_not_found",
+        "location_not_found",
+        "zone_not_empty",
+        "open_handover",
+        "no_active_search",
+        "search_stale",
+        "not_ready_to_close",
+        "illegal_transfer",
     ] | None = None
 
 
@@ -299,3 +322,157 @@ class BookingOut(BaseModel):
     legs: list[BookingLegOut]
     # Present when the whole order could not be confirmed right now.
     waitlist_reason: str | None = None
+
+
+# ================================================================ evacuation
+# Evacuation headcount and clearance run inside an *incident*.  Every location
+# is identified by an existing stop name: an incident lists disjoint zones to
+# clear and safe assembly points to account people at.  Planning suggestions
+# and shuttle bookings are never evacuation evidence: only the registered
+# findings and handover confirmations below move a person.
+
+NonEmptyName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class IncidentIn(BaseModel):
+    # Client-generated idempotency key, unique across all incidents.
+    request_id: NonEmptyName
+    name: NonEmptyName
+    zones: list[NonEmptyName] = Field(min_length=1)
+    safe_points: list[NonEmptyName] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _disjoint_locations(self):
+        if len(set(self.zones)) != len(self.zones):
+            raise ValueError("zone names must be unique")
+        if len(set(self.safe_points)) != len(self.safe_points):
+            raise ValueError("safe point names must be unique")
+        overlap = set(self.zones) & set(self.safe_points)
+        if overlap:
+            raise ValueError(
+                f"a location cannot be both a zone and a safe point: {sorted(overlap)}"
+            )
+        return self
+
+
+class PersonEntryIn(BaseModel):
+    # Unique within the incident; may be added any time while it is open.
+    person_no: NonEmptyName
+    # None / omitted means the location is still to be verified; otherwise the
+    # person is already known to be in one of the incident's zones.
+    zone: NonEmptyName | None = None
+
+
+class RegisterPeopleIn(BaseModel):
+    request_id: NonEmptyName
+    people: list[PersonEntryIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _unique_numbers(self):
+        numbers = [p.person_no for p in self.people]
+        if len(set(numbers)) != len(numbers):
+            raise ValueError("person_no must be unique within one request")
+        return self
+
+
+class FindPersonIn(BaseModel):
+    request_id: NonEmptyName
+    person_no: NonEmptyName
+    # Where the person was actually found: a zone or a safe point.
+    location: NonEmptyName
+
+
+class HandoverIn(BaseModel):
+    request_id: NonEmptyName
+    from_zone: NonEmptyName
+    # Another zone (zone-to-zone transfer) or a safe point (final evacuation).
+    to_location: NonEmptyName
+    person_nos: list[NonEmptyName] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _unique_numbers(self):
+        if len(set(self.person_nos)) != len(self.person_nos):
+            raise ValueError("person_no must be unique within one handover")
+        return self
+
+
+class HandoverActionIn(BaseModel):
+    request_id: NonEmptyName
+    person_nos: list[NonEmptyName] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _unique_numbers(self):
+        if len(set(self.person_nos)) != len(self.person_nos):
+            raise ValueError("person_no must be unique within one request")
+        return self
+
+
+class SearchIn(BaseModel):
+    request_id: NonEmptyName
+
+
+class CloseIn(BaseModel):
+    request_id: NonEmptyName
+
+
+class PersonOut(BaseModel):
+    person_no: str
+    # unknown = location still to be verified; in_zone = physically in a zone;
+    # in_transit = named on an unfinished handover; safe = at a safe point.
+    status: Literal["unknown", "in_zone", "in_transit", "safe"]
+    zone: str | None
+    safe_point: str | None
+    # The handover the person is currently riding, when in transit.
+    current_handover_id: int | None
+
+
+class HandoverPersonOut(BaseModel):
+    person_no: str
+    # pending = still in transit; received = confirmed by the receiving party;
+    # returned = confirmed back at the originating zone.
+    status: Literal["pending", "received", "returned"]
+    resolved_at_safe: bool
+
+
+class HandoverOut(BaseModel):
+    handover_id: int
+    request_id: str
+    from_zone: str
+    to_location: str
+    destination_kind: Literal["zone", "safe_point"]
+    status: Literal["open", "complete"]
+    people: list[HandoverPersonOut]
+    pending: list[str]
+    received: list[str]
+    returned: list[str]
+
+
+class ZoneOut(BaseModel):
+    zone: str
+    occupants: list[str]
+    open_handovers: list[int]
+    search_started: bool
+    search_valid: bool
+    cleared: bool
+    # Bumped on every person entry/leave and every handover change touching the
+    # zone; a clearance only stays valid while this matches the search's
+    # generation, so other zones' activity never disturbs it.
+    activity_version: int
+
+
+class IncidentOut(BaseModel):
+    incident_id: int
+    request_id: str
+    name: str
+    zones: list[str]
+    safe_points: list[str]
+    status: Literal["open", "closed"]
+    people: list[PersonOut]
+    handovers: list[HandoverOut]
+    zone_states: list[ZoneOut]
+    safe_occupants: dict[str, list[str]]
+    # Closure readiness and the concrete blockers, computed from the ledger.
+    ready_to_close: bool
+    blockers: dict[str, list[str]]
+    people_safe: int
+    people_total: int
