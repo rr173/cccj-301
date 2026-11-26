@@ -9,6 +9,9 @@ from fastapi.responses import JSONResponse
 
 from .db import Database
 from .model import (
+    ActualEventIn,
+    BoardIn,
+    BookingIn,
     ClosureIn,
     ClosureOut,
     ConfirmIn,
@@ -16,10 +19,13 @@ from .model import (
     JourneyOut,
     PlanOut,
     PlanRequest,
+    RunIn,
     SegmentIn,
     Window,
 )
 from .network import Segment as DomainSegment
+from . import shuttle
+from .shuttle import ShuttleError
 from .trips import Trip, TripError, start_trip, sync_trip
 
 
@@ -72,6 +78,11 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @app.exception_handler(TripError)
     async def _trip_error(_request: Request, exc: TripError) -> JSONResponse:
+        body = ErrorBody(detail=exc.detail, reason=exc.reason)  # type: ignore[arg-type]
+        return JSONResponse(status_code=exc.status, content=body.model_dump())
+
+    @app.exception_handler(ShuttleError)
+    async def _shuttle_error(_request: Request, exc: ShuttleError) -> JSONResponse:
         body = ErrorBody(detail=exc.detail, reason=exc.reason)  # type: ignore[arg-type]
         return JSONResponse(status_code=exc.status, content=body.model_dump())
 
@@ -187,6 +198,61 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             trip.checked_version = db.closure_version()
             db.save_trip(trip)
             return _journey_out(trip)
+
+    # ----------------------------------------------------------- shuttle runs
+    @app.post("/shuttle/runs", status_code=201)
+    def add_run(body: RunIn, db: Database = Depends(get_db)):
+        run_id = shuttle.register_run(db, db.load_network(), body)
+        return shuttle.get_run_out(db, run_id)
+
+    @app.get("/shuttle/runs")
+    def list_runs(db: Database = Depends(get_db)):
+        return [shuttle.get_run_out(db, run_id) for run_id in shuttle.list_run_ids(db)]
+
+    @app.get("/shuttle/runs/{run_id}")
+    def read_run(run_id: int, db: Database = Depends(get_db)):
+        return shuttle.get_run_out(db, run_id)
+
+    @app.get("/shuttle/runs/{run_id}/manifest")
+    def read_manifest(run_id: int, db: Database = Depends(get_db)):
+        # Validates the run exists before producing a ledger.
+        shuttle.get_run_out(db, run_id)
+        return shuttle.manifest(db, run_id)
+
+    @app.post("/shuttle/runs/{run_id}/stops/{index}/arrival")
+    def arrive(run_id: int, index: int, body: ActualEventIn, db: Database = Depends(get_db)):
+        return shuttle.record_arrival(db, run_id, index, body.actual_min)
+
+    @app.post("/shuttle/runs/{run_id}/stops/{index}/boarding")
+    def board(run_id: int, index: int, body: BoardIn, db: Database = Depends(get_db)):
+        return shuttle.record_boarding(
+            db, run_id, index, body.booking_id, body.actual_min
+        )
+
+    @app.post("/shuttle/runs/{run_id}/stops/{index}/departure")
+    def depart(run_id: int, index: int, body: ActualEventIn, db: Database = Depends(get_db)):
+        return shuttle.record_departure(db, run_id, index, body.actual_min)
+
+    # -------------------------------------------------------------- bookings
+    @app.post("/bookings")
+    def create_booking(body: BookingIn, db: Database = Depends(get_db)):
+        view, created = shuttle.submit_booking(db, body)
+        return JSONResponse(
+            status_code=201 if created else 200,
+            content=view.model_dump(),
+        )
+
+    @app.get("/bookings/by-request/{request_id}")
+    def read_booking_by_request(request_id: str, db: Database = Depends(get_db)):
+        return shuttle.get_booking_by_request(db, request_id)
+
+    @app.get("/bookings/{booking_id}")
+    def read_booking(booking_id: int, db: Database = Depends(get_db)):
+        return shuttle.get_booking_out(db, booking_id)
+
+    @app.post("/bookings/{booking_id}/cancel")
+    def cancel_booking(booking_id: int, db: Database = Depends(get_db)):
+        return shuttle.cancel_booking(db, booking_id)
 
     return app
 
