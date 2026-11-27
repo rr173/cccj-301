@@ -150,6 +150,16 @@ def _load_booking(db, booking_id: int):
     return bundle["booking"], bundle["legs"]
 
 
+def _assert_run_not_cancelled(db, run: RunView) -> None:
+    cancellation = db.get_cancellation_by_run(run.id)
+    if cancellation is not None:
+        raise ShuttleError(
+            f"run {run.id} is cancelled ({cancellation['request_id']!r})",
+            "run_cancelled",
+            409,
+        )
+
+
 # ------------------------------------------------------------- run registry
 def register_run(db, network, body: RunIn) -> int:
     segments = network.segments
@@ -232,6 +242,11 @@ def _promote_waitlist(db) -> None:
             for row in leg_rows
         ]
         run_views = _run_views_for(db, legs)
+        # A waitlisted order containing a cancelled run is void, even if an
+        # older cancellation sweep was somehow bypassed.
+        if any(db.get_cancellation_by_run(leg["run_id"]) is not None for leg in legs):
+            db.set_booking_status(booking_id, "void")
+            continue
         # A waitlisted order whose boarding stop has left is dead and is swept
         # here as well as at departure time.
         if _any_boarding_departed(run_views, legs):
@@ -269,6 +284,7 @@ def submit_booking(db, body: BookingIn) -> tuple[BookingOut, bool]:
             run_views: dict[int, RunView] = {}
             for leg in leg_inputs:
                 run = _load_run(db, leg["run_id"])
+                _assert_run_not_cancelled(db, run)
                 run_views[run.id] = run
                 # Index validity is enforced by stop(); the alighting stop must
                 # exist as a real stop, and a covered interval needs a start.
@@ -361,6 +377,7 @@ def _assert_after_last_actual(run: RunView, actual_min: int) -> None:
 def record_arrival(db, run_id: int, index: int, actual_min: int) -> RunOut:
     with db.lock, db.begin():
         run = _load_run(db, run_id)
+        _assert_run_not_cancelled(db, run)
         stop = run.stop(index)
         if stop.arrived:
             raise ShuttleError(
@@ -398,6 +415,7 @@ def record_arrival(db, run_id: int, index: int, actual_min: int) -> RunOut:
 def record_boarding(db, run_id: int, index: int, booking_id: int, actual_min: int) -> RunOut:
     with db.lock, db.begin():
         run = _load_run(db, run_id)
+        _assert_run_not_cancelled(db, run)
         stop = run.stop(index)
         if not stop.arrived:
             raise ShuttleError(
@@ -412,7 +430,7 @@ def record_boarding(db, run_id: int, index: int, booking_id: int, actual_min: in
         _assert_after_last_actual(run, actual_min)
 
         booking_row, leg_rows = _load_booking(db, booking_id)
-        if booking_row["status"] != "confirmed":
+        if booking_row["status"] not in ("confirmed", "unplaced"):
             raise ShuttleError(
                 f"booking {booking_id} is {booking_row['status']}, not confirmed",
                 "not_confirmable",
@@ -461,6 +479,7 @@ def record_boarding(db, run_id: int, index: int, booking_id: int, actual_min: in
 def record_departure(db, run_id: int, index: int, actual_min: int) -> RunOut:
     with db.lock, db.begin():
         run = _load_run(db, run_id)
+        _assert_run_not_cancelled(db, run)
         stop = run.stop(index)
         if not stop.arrived:
             raise ShuttleError(
@@ -501,7 +520,9 @@ def record_departure(db, run_id: int, index: int, actual_min: int) -> RunOut:
 
 def _refresh_booking_status(db, booking_id: int) -> None:
     booking_row, leg_rows = _load_booking(db, booking_id)
-    if booking_row["status"] in ("cancelled", "void"):
+    if booking_row["status"] in ("cancelled", "void", "unplaced"):
+        # 'unplaced' is an explicit cancellation outcome.  Riding the retained
+        # prefix must not silently relabel the unresolved order 'completed'.
         return
     if all(row["status"] == "alighted" for row in leg_rows):
         db.set_booking_status(booking_id, "completed")
@@ -551,6 +572,7 @@ def _stop_state(stop: StopView, is_last: bool) -> str:
 
 def _run_out(db, run: RunView) -> RunOut:
     loads = _interval_loads(db, run)
+    cancellation = db.get_cancellation_by_run(run.id)
     intervals = []
     for i in range(len(run.stops) - 1):
         intervals.append(
@@ -581,6 +603,15 @@ def _run_out(db, run: RunView) -> RunOut:
         ],
         wheelchair_capacity=run.capacity,
         finished=run.finished,
+        status=(
+            "cancelled"
+            if cancellation is not None
+            else ("finished" if run.finished else "scheduled")
+        ),
+        cancelled=cancellation is not None,
+        cancellation_request_id=(
+            cancellation["request_id"] if cancellation is not None else None
+        ),
         intervals=intervals,
     )
 
@@ -625,6 +656,19 @@ def _booking_out(db, booking_id: int) -> BookingOut:
             )
         )
     status = booking_row["status"]
+    placement_status = None
+    last_cancellation_id = None
+    if "placement_status" in booking_row.keys():
+        placement_status = booking_row["placement_status"]
+    if "last_cancellation_id" in booking_row.keys():
+        last_cancellation_id = booking_row["last_cancellation_id"]
+    last_cancellation = None
+    if last_cancellation_id is not None:
+        cancellation_row = db.get_cancellation_by_id(last_cancellation_id)
+        if cancellation_row is not None:
+            last_cancellation = json.loads(cancellation_row["response_body"])
+    if status == "unplaced":
+        placement_status = "unplaced"
     if status == "waiting":
         # Explain the blockage on the first interval that runs out of space.
         for row in leg_rows:
@@ -648,6 +692,12 @@ def _booking_out(db, booking_id: int) -> BookingOut:
         status=status,
         legs=legs_out,
         waitlist_reason=waitlist_reason,
+        unplaced=status == "unplaced",
+        placement_status=placement_status,
+        rebooking_status=placement_status,
+        last_cancellation_id=last_cancellation_id,
+        last_cancellation=last_cancellation,
+        cancellation=last_cancellation,
     )
 
 

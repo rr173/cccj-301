@@ -86,6 +86,9 @@ unrelated request wait for a large re-plan.
 | `GET`    | `/bookings/{id}`         | read one booking by its id                |
 | `GET`    | `/bookings/by-request/{request_id}` | read one booking by request id   |
 | `POST`   | `/bookings/{id}/cancel`  | cancel before first boarding              |
+| `POST`   | `/shuttle/cancellations` | cancel a pre-service run and rebook groups |
+| `GET`    | `/shuttle/cancellations/{request_or_id}` | immutable cancellation receipt |
+| `GET`    | `/shuttle/runs/{id}/cancellation` | receipt for one cancelled run |
 | `POST`   | `/evac/incidents`        | open an evacuation incident (idempotent)  |
 | `GET`    | `/evac/incidents`        | list incidents with their full ledgers    |
 | `GET`    | `/evac/incidents/{id}`   | full headcount/handover/clearance ledger  |
@@ -189,6 +192,83 @@ original application order.  A group that still cannot fit is skipped; the
 first group whose whole order fits is confirmed; evaluation then continues
 with the next group against the space that remains.  A waitlisted order whose
 boarding stop departs is marked `void` and can never be promoted.
+
+### Cancelling a run and rebooking affected groups
+
+A dispatcher can take a run out of service before its **first stop arrival** is
+recorded.  The cancellation request carries its own idempotency key and every
+affected group's ranked alternatives:
+
+```bash
+curl -s localhost:8000/shuttle/runs/7/cancel -X POST \
+  -H 'content-type: application/json' -d '{
+    "request_id": "cancel-run-7-001",
+    "alternatives": [
+      {
+        "booking_id": 12,
+        "options": [
+          {"legs": [{"run_id": 9, "board_index": 1, "alight_index": 2}]},
+          {"legs": [
+            {"run_id": 10, "board_index": 1, "alight_index": 2},
+            {"run_id": 11, "board_index": 0, "alight_index": 1}
+          ]}
+        ]
+      }
+    ]
+  }'
+```
+
+`POST /shuttle/cancellations` is the collection form; include `"run_id": 7` in
+the body.  The API also accepts `options`/`choices`/`plans` as the ranked list
+name, a mapping keyed by booking id or booking `request_id`, raw leg lists as
+options, and camelCase field aliases.
+
+The operation is one transaction:
+
+- Only `confirmed` orders (and previously `unplaced` orders that still contain
+  the run in their effective retained arrangement) are reworked.
+- The suffix beginning with the cancelled run is removed.  Earlier legs,
+  actual board/alight minutes, and the onboard ledger are never rewritten.
+- An alternative must reconnect the removed suffix's original boarding stop to
+  its original destination.  Retained plus replacement legs remain at most two
+  different shuttle runs.
+- Candidate boarding stops must not have a recorded departure, and no candidate
+  leg may use a cancelled run.
+- A connection after a retained leg uses the recorded actual alighting minute
+  when present; otherwise it uses planned arrival.  Planned transfer times are
+  used inside a replacement.  On-site boarding still performs the original
+  actual-alighting verification.
+- Retained `reserved`/`boarded` legs keep occupying space; removed reservations
+  release it.  All groups are allocated jointly against the remaining
+  wheelchair intervals.  The allocation first maximises the number of complete
+  group placements, then compares groups in original application order and
+  prefers smaller option indexes; unplaced is ordered after every supplied
+  option.
+- A group with no allocatable complete option becomes `"status": "unplaced"`
+  on `GET /bookings/{id}` (also `"unplaced": true`) and is **not** waitlisted.
+  Its retained legs remain boardable.
+- Waiting orders containing the cancelled run become `void`.  Other waiting
+  orders are then promoted by the existing order/capacity rules using the
+  remaining space.
+- Afterwards, bookings and live events on the cancelled run are rejected with
+  `409 run_cancelled`; `GET /shuttle/runs/{id}` reports `cancelled: true`.
+
+The response is an immutable receipt.  It lists every affected booking, the
+snapshot of removed legs, the selected preference index and allocated
+replacement legs, or `status: "unplaced"`.  Query the same receipt with:
+
+```text
+GET /shuttle/cancellations/by-request/{request_id}
+GET /shuttle/cancellations/{request_id-or-receipt-id}
+GET /shuttle/runs/{run_id}/cancellation
+```
+
+Repeating the identical operation request returns the original receipt (`200`;
+the first collection-form response is `201`).  Reusing the same operation
+request id with different logical content returns
+`409 duplicate_request`.  A later cancellation creates a separate receipt and
+does not modify earlier receipts; subsequent work uses the booking's then
+current legs.
 
 ### Driving a run (staff)
 
@@ -402,6 +482,13 @@ untouched.
   after cancellation/arrival/departure;
 - state surviving a full application restart against the same SQLite file, and
   concurrent bookings that never oversell a single wheelchair space.
+
+`tests/test_cancellations.py` covers pre-service cancellation eligibility,
+suffix-only rebooking, retained actual events, actual-vs-planned transfer
+timing, departed/cancelled candidates, joint maximum-placement and preference
+allocation, unplaced orders without waitlisting, waitlist voiding/promotion,
+idempotent immutable receipts, later cancellations, restart persistence, and
+concurrent capacity safety.
 
 `tests/test_evacuation.py` covers the evacuation service end to end:
 

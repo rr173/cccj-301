@@ -147,6 +147,11 @@ class ErrorBody(BaseModel):
         "transfer_not_verified",
         "not_boardable",
         "illegal_event",
+        # ------------------------------------------------- run cancellations
+        "run_cancelled",
+        "run_already_started",
+        "cancellation_not_found",
+        "alternative_invalid",
         # ------------------------------------------------ evacuation headcount
         "incident_not_found",
         "incident_closed",
@@ -233,7 +238,12 @@ class RunOut(BaseModel):
     stops: list[RunStopOut]
     wheelchair_capacity: int
     finished: bool
+    status: str = "scheduled"
     intervals: list[RunIntervalOut]
+    # A cancelled run keeps its planned stops for receipts/history but can no
+    # longer accept bookings or live events.
+    cancelled: bool = False
+    cancellation_request_id: str | None = None
 
 
 class ActualEventIn(BaseModel):
@@ -318,10 +328,26 @@ class BookingOut(BaseModel):
     request_id: str
     group_name: str | None
     wheelchair_count: int
-    status: Literal["waiting", "confirmed", "cancelled", "void", "completed"]
+    # unplaced = a cancellation removed the remaining suffix and no complete
+    # alternative could be allocated.  Such an order is deliberately not
+    # waitlisted, while its retained legs remain valid and boardable.
+    status: Literal[
+        "waiting",
+        "confirmed",
+        "cancelled",
+        "void",
+        "completed",
+        "unplaced",
+    ]
     legs: list[BookingLegOut]
     # Present when the whole order could not be confirmed right now.
     waitlist_reason: str | None = None
+    unplaced: bool = False
+    placement_status: Literal["rebooked", "unplaced"] | None = None
+    rebooking_status: Literal["rebooked", "unplaced"] | None = None
+    last_cancellation_id: int | None = None
+    last_cancellation: dict | None = None
+    cancellation: dict | None = None
 
 
 # ================================================================ evacuation

@@ -95,10 +95,17 @@ CREATE TABLE IF NOT EXISTS bookings (
     wheelchair_count INTEGER NOT NULL CHECK (wheelchair_count > 0),
     -- waiting = waitlisted (holds no space); confirmed = at least one leg
     -- still live; cancelled = visitor cancel; void = missed a boarding;
-    -- completed = every leg alighted.
+    -- completed = every leg alighted; unplaced = cancellation left no
+    -- complete alternative (retained legs may still be live).
     status TEXT NOT NULL CHECK (
-        status IN ('waiting', 'confirmed', 'cancelled', 'void', 'completed')
-    )
+        status IN (
+            'waiting', 'confirmed', 'cancelled', 'void', 'completed', 'unplaced'
+        )
+    ),
+    placement_status TEXT CHECK (
+        placement_status IS NULL OR placement_status IN ('rebooked', 'unplaced')
+    ),
+    last_cancellation_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS booking_legs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +122,22 @@ CREATE TABLE IF NOT EXISTS booking_legs (
     UNIQUE (booking_id, leg_position)
 );
 CREATE INDEX IF NOT EXISTS idx_legs_run ON booking_legs(run_id, status);
+
+-- -------------------------------------------------------- run cancellations
+-- One immutable receipt per out-of-service run and one global operation
+-- request id.  response_body is the exact replay payload and remains fixed
+-- even when later cancellations rebook the same original order again.
+CREATE TABLE IF NOT EXISTS shuttle_cancellation_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL UNIQUE,
+    run_id INTEGER NOT NULL UNIQUE REFERENCES shuttle_runs(id),
+    content_hash TEXT NOT NULL,
+    response_status INTEGER NOT NULL,
+    response_body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_cancellation_run
+    ON shuttle_cancellation_requests(run_id);
 
 -- ============================================================ evacuation
 CREATE TABLE IF NOT EXISTS evac_incidents (
@@ -241,6 +264,67 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys = ON")
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
+            self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Add post-initial-release columns/check values to older DB files."""
+        conn = self._conn
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='bookings'"
+        ).fetchone()
+        table_sql = row[0] if row is not None else ""
+        if "'unplaced'" not in table_sql:
+            # SQLite cannot alter a CHECK constraint.  Rebuild the tiny bookings
+            # table while preserving all ids referenced by booking_legs.
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("ALTER TABLE bookings RENAME TO bookings_legacy")
+            conn.execute(
+                """
+                CREATE TABLE bookings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL UNIQUE,
+                    content_hash TEXT NOT NULL,
+                    group_name TEXT,
+                    wheelchair_count INTEGER NOT NULL CHECK (wheelchair_count > 0),
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'waiting', 'confirmed', 'cancelled', 'void',
+                            'completed', 'unplaced'
+                        )
+                    ),
+                    placement_status TEXT CHECK (
+                        placement_status IS NULL
+                        OR placement_status IN ('rebooked', 'unplaced')
+                    ),
+                    last_cancellation_id INTEGER
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO bookings(
+                    id, request_id, content_hash, group_name,
+                    wheelchair_count, status
+                )
+                SELECT id, request_id, content_hash, group_name,
+                       wheelchair_count, status
+                FROM bookings_legacy
+                """
+            )
+            conn.execute("DROP TABLE bookings_legacy")
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys = ON")
+
+        columns = {
+            r["name"] for r in conn.execute("PRAGMA table_info(bookings)").fetchall()
+        }
+        if "placement_status" not in columns:
+            conn.execute("ALTER TABLE bookings ADD COLUMN placement_status TEXT")
+        if "last_cancellation_id" not in columns:
+            conn.execute(
+                "ALTER TABLE bookings ADD COLUMN last_cancellation_id INTEGER"
+            )
 
     @property
     def lock(self) -> threading.RLock:
@@ -598,6 +682,106 @@ class Database:
         self._conn.execute(
             "UPDATE bookings SET status=? WHERE id=?", (status, booking_id)
         )
+
+    def set_booking_placement(
+        self,
+        booking_id: int,
+        status: str,
+        placement_status: str | None,
+        cancellation_id: int | None,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE bookings SET status=?, placement_status=?,"
+            " last_cancellation_id=? WHERE id=?",
+            (status, placement_status, cancellation_id, booking_id),
+        )
+
+    def insert_booking_leg(
+        self,
+        booking_id: int,
+        position: int,
+        run_id: int,
+        board_index: int,
+        alight_index: int,
+        status: str = "reserved",
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO booking_legs(booking_id, leg_position, run_id,"
+            " board_index, alight_index, status) VALUES (?,?,?,?,?,?)",
+            (booking_id, position, run_id, board_index, alight_index, status),
+        )
+        return int(cur.lastrowid)
+
+    def delete_booking_legs_from(self, booking_id: int, position: int) -> None:
+        self._conn.execute(
+            "DELETE FROM booking_legs WHERE booking_id=? AND leg_position>=?",
+            (booking_id, position),
+        )
+
+    def waiting_booking_ids_for_run(self, run_id: int) -> list[int]:
+        rows = self._conn.execute(
+            "SELECT DISTINCT b.id FROM bookings b"
+            " JOIN booking_legs bl ON bl.booking_id=b.id"
+            " WHERE b.status='waiting' AND bl.run_id=? ORDER BY b.id",
+            (run_id,),
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    # ------------------------------------------------------- cancellation ledger
+    def insert_cancellation_request(
+        self,
+        request_id: str,
+        run_id: int,
+        content_hash: str,
+        response_status: int,
+        response_body: str,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO shuttle_cancellation_requests(request_id, run_id,"
+            " content_hash, response_status, response_body)"
+            " VALUES (?,?,?,?,?)",
+            (
+                request_id,
+                run_id,
+                content_hash,
+                response_status,
+                response_body,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def update_cancellation_response(
+        self, cancellation_id: int, response_status: int, response_body: str
+    ) -> None:
+        self._conn.execute(
+            "UPDATE shuttle_cancellation_requests SET response_status=?,"
+            " response_body=? WHERE id=?",
+            (response_status, response_body, cancellation_id),
+        )
+
+    def get_cancellation_request(self, request_id: str):
+        return self._conn.execute(
+            "SELECT * FROM shuttle_cancellation_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+
+    def get_cancellation_by_id(self, cancellation_id: int):
+        return self._conn.execute(
+            "SELECT * FROM shuttle_cancellation_requests WHERE id=?",
+            (cancellation_id,),
+        ).fetchone()
+
+    def get_cancellation_by_run(self, run_id: int):
+        return self._conn.execute(
+            "SELECT * FROM shuttle_cancellation_requests WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+
+    def list_cancellation_ids(self) -> list[int]:
+        rows = self._conn.execute(
+            "SELECT id FROM shuttle_cancellation_requests ORDER BY id"
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
 
     def promote_waiting_legs(self, booking_id: int) -> None:
         # Atomically turn the whole order's placeholder legs into real

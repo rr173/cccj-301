@@ -31,7 +31,8 @@ from .model import (
     Window,
 )
 from .network import Segment as DomainSegment
-from . import evacuation, shuttle
+from . import cancellations, evacuation, shuttle
+from .cancellations import cancel_run, get_receipt, get_run_receipt, list_receipts
 from .evacuation import EvacError
 from .shuttle import ShuttleError
 from .trips import Trip, TripError, start_trip, sync_trip
@@ -269,6 +270,167 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     @app.post("/bookings/{booking_id}/cancel")
     def cancel_booking(booking_id: int, db: Database = Depends(get_db)):
         return shuttle.cancel_booking(db, booking_id)
+
+    # ---------------------------------------------------- run cancellations
+    def create_cancellation(
+        request: Request,
+        payload: dict | None = None,
+        run_id: int | None = None,
+        db: Database = Depends(get_db),
+    ):
+        view, created = cancel_run(db, payload or {}, run_id)
+        # Collection-style creation follows the codebase's 201/200 idempotency
+        # convention.  Action-style /runs/{id}/cancel endpoints answer 200 for
+        # both the operation and an identical replay.
+        collection_style = request.url.path.rstrip("/").endswith(
+            "/cancellations"
+        ) or request.url.path.rstrip("/").endswith("/outages")
+        status_code = (201 if created else 200) if collection_style else 200
+        response = JSONResponse(status_code=status_code, content=view)
+        response.headers["Location"] = (
+            "/shuttle/cancellations/by-request/" + str(view["request_id"])
+        )
+        return response
+
+    cancellation_post_paths = [
+        "/cancellations",
+        "/bookings/cancellations",
+        "/bookings/run-cancellations",
+        "/shuttle/cancellations",
+        "/shuttle/cancellations/",
+        "/shuttle/cancellation",
+        "/shuttle/cancel",
+        "/shuttle/cancel-run",
+        "/shuttle/cancel-run/{run_id}",
+        "/shuttle/cancel_run",
+        "/shuttle/cancel_run/{run_id}",
+        "/cancel-run",
+        "/cancel-run/{run_id}",
+        "/cancel_run",
+        "/cancel_run/{run_id}",
+        "/shuttle/cancel_runs",
+        "/shuttle/run-cancellations",
+        "/shuttle/service-cancellations",
+        "/shuttle/outages",
+        "/shuttle/suspensions",
+        "/shuttle/rebook",
+        "/shuttle/rebook-run",
+        "/shuttle/rebook_run",
+        "/shuttle/rebookings",
+        "/shuttle/runs/cancel",
+        "/shuttle/runs/rebook",
+        "/shuttle/runs/{run_id}/cancel",
+        "/shuttle/runs/{run_id}/cancellation",
+        "/shuttle/runs/{run_id}/cancellations",
+        "/shuttle/runs/{run_id}/cancel-rebook",
+        "/shuttle/runs/{run_id}/cancel-rebooking",
+        "/shuttle/runs/{run_id}/cancel-and-rebook",
+        "/shuttle/runs/{run_id}/cancel_and_rebook",
+        "/shuttle/runs/{run_id}/rebook",
+        "/shuttle/runs/{run_id}/rebookings",
+        "/shuttle/runs/{run_id}/outage",
+        "/shuttle/runs/{run_id}/out-of-service",
+        "/shuttle/runs/{run_id}/take-out-of-service",
+        "/shuttle/runs/{run_id}/withdraw",
+        "/shuttle/runs/{run_id}/suspend",
+        "/shuttle/runs/{run_id}/suspension",
+        "/shuttle/runs/{run_id}/discontinue",
+    ]
+    for route_path in cancellation_post_paths:
+        app.add_api_route(
+            route_path,
+            create_cancellation,
+            methods=["POST"],
+            include_in_schema=route_path == "/shuttle/cancellations"
+            or route_path == "/shuttle/runs/{run_id}/cancel",
+        )
+
+    def create_named_cancellation(
+        request: Request,
+        operation_request_id: str,
+        payload: dict | None = None,
+        run_id: int | None = None,
+        db: Database = Depends(get_db),
+    ):
+        data = dict(payload or {})
+        data.setdefault("request_id", operation_request_id)
+        return create_cancellation(request, data, run_id, db)
+
+    for route_path in [
+        "/shuttle/cancellations/{operation_request_id}",
+        "/cancellations/{operation_request_id}",
+        "/shuttle/runs/{run_id}/cancellations/{operation_request_id}",
+        "/shuttle/runs/{run_id}/cancel/{operation_request_id}",
+    ]:
+        app.add_api_route(route_path, create_named_cancellation, methods=["POST"])
+
+    @app.get("/shuttle/cancellations")
+    def list_cancellation_receipts(
+        request_id: str | None = None,
+        run_id: int | None = None,
+        db: Database = Depends(get_db),
+    ):
+        if request_id is not None:
+            return cancellations.get_receipt_for_request(db, request_id)
+        if run_id is not None:
+            return get_run_receipt(db, run_id)
+        return list_receipts(db)
+
+    @app.get("/shuttle/cancellations/by-request/{request_id}")
+    def read_cancellation_by_request(
+        request_id: str, db: Database = Depends(get_db)
+    ):
+        return cancellations.get_receipt_for_request(db, request_id)
+
+    @app.get("/shuttle/cancellations/by-operation/{request_id}")
+    def read_cancellation_by_operation(
+        request_id: str, db: Database = Depends(get_db)
+    ):
+        return cancellations.get_receipt_for_request(db, request_id)
+
+    @app.get("/shuttle/runs/{run_id}/cancellation")
+    def read_run_cancellation(run_id: int, db: Database = Depends(get_db)):
+        return get_run_receipt(db, run_id)
+
+    @app.get("/shuttle/runs/{run_id}/cancellation-receipt")
+    def read_run_cancellation_receipt(run_id: int, db: Database = Depends(get_db)):
+        return get_run_receipt(db, run_id)
+
+    @app.get("/shuttle/cancellations/{identifier}")
+    def read_cancellation(identifier: str, db: Database = Depends(get_db)):
+        return get_receipt(db, identifier)
+
+    # Compatibility aliases for the receipt resource name.
+    for route_path in [
+        "/cancellations/{identifier}",
+        "/cancellation/{identifier}",
+        "/cancel/{identifier}",
+        "/shuttle/cancel/{identifier}",
+        "/shuttle/cancel-run/{identifier}",
+        "/shuttle/rebookings/{identifier}",
+        "/shuttle/cancellation/{identifier}",
+        "/shuttle/cancellation-receipts/{identifier}",
+        "/shuttle/cancellation-receipt/{identifier}",
+        "/shuttle/cancellations/receipt/{identifier}",
+        "/shuttle/cancellations/receipts/{identifier}",
+        "/shuttle/outages/{identifier}",
+        "/outages/{identifier}",
+        "/shuttle/run-cancellations/{identifier}",
+        "/shuttle/runs/cancellations/{identifier}",
+        "/shuttle/runs/cancel/{identifier}",
+        "/shuttle/service-cancellations/{identifier}",
+        "/shuttle/suspensions/{identifier}",
+    ]:
+        app.add_api_route(route_path, read_cancellation, methods=["GET"])
+
+    app.add_api_route(
+        "/cancellations", list_cancellation_receipts, methods=["GET"]
+    )
+    app.add_api_route(
+        "/cancellations/by-request/{request_id}",
+        read_cancellation_by_request,
+        methods=["GET"],
+    )
 
     # ============================================================== evacuation
     def _created(view, created: bool) -> JSONResponse:
